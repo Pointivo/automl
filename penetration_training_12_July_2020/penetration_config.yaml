@@ -1,0 +1,17 @@
+num_classes: 1
+#var_freeze_expr: '(efficientnet|fpn_cells|resample_p6)'
+label_id_mapping: {1: penetration}
+moving_average_decay: 0.9998
+iou_loss_type: "giou"
+box_loss_weight: 5.0
+iou_loss_weight: 1.0
+#nms_configs: {"method": "hard", "iou_thresh": 0.25} -> used during training
+nms_configs: {"method": "hard", "iou_thresh": 0.1}
+disable_pyfun: true # set to false during training and set to True during inference and exporting to frozen graph
+train_scale_min: 0.1
+train_scale_max: 2.0
+num_epochs: 30
+learning_rate: 0.08
+lr_warmup_epoch: 5
+lr_warmup_init: 0.00025
+mixed_precision: true # set to true for GPU and false for CPU

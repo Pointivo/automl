@@ -687,6 +687,10 @@ class AnchorLabeler(object):
                           nms_configs=None):
     """Generate detections based on class and box predictions."""
     if disable_pyfun:
+      nms_configs = nms_configs if nms_configs is not None else {}
+      iou_threshold = nms_configs.get('iou_thresh', 0.5)
+      soft_nms_sigma = nms_configs.get('sigma', 0.25)
+      soft_nms_sigma = 0.0 if nms_configs.get('method') == 'hard' else soft_nms_sigma
       return _generate_detections_tf(
           cls_outputs,
           box_outputs,
@@ -697,7 +701,9 @@ class AnchorLabeler(object):
           image_scale,
           image_size,
           min_score_thresh=min_score_thresh,
-          max_boxes_to_draw=max_boxes_to_draw)
+          max_boxes_to_draw=max_boxes_to_draw,
+          soft_nms_sigma=soft_nms_sigma,
+          iou_threshold=iou_threshold)
     else:
       logging.info('nms_configs=%s', nms_configs)
       return tf.py_func(

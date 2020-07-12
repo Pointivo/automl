@@ -22,6 +22,7 @@ from __future__ import print_function
 import os
 import time
 from typing import Text, Tuple, List
+from pathlib import Path
 
 from absl import app
 from absl import flags
@@ -146,6 +147,67 @@ class ModelInspector(object):
     driver.build()
     driver.export(self.saved_model_dir, self.tflite_path, self.tensorrt)
 
+  def saved_model_inference_od_json(self, image_path_pattern, **kwargs):
+    """Perform inference for the given saved model."""
+    from image_recognition.app.dvo.ground_truths.object_detection import ObjectDetectionLabeledData
+    from image_recognition.app.dvo.bbox_2d.axis_aligned_bbox_2d import AxisAlignedBbox2D
+    assert 'min_score_thresh' in kwargs, f'min_score_thresh should be present in kwargs.'
+    driver = inference.ServingDriver(
+        self.model_name,
+        self.ckpt_path,
+        batch_size=self.batch_size,
+        use_xla=self.use_xla,
+        model_params=self.model_config.as_dict(),
+        **kwargs)
+    driver.load(self.saved_model_dir)
+    # Serving time batch size should be fixed.
+    batch_size = self.batch_size or 1
+    all_files = sorted(list(tf.io.gfile.glob(image_path_pattern)))
+    print('all_files=', all_files)
+    num_batches = (len(all_files) + batch_size - 1) // batch_size
+
+    for i in range(num_batches):
+      batch_files = all_files[i * batch_size:(i + 1) * batch_size]
+      height, width = self.model_config.image_size
+      images = [Image.open(f) for f in batch_files]
+      orig_image_sizes_in_batch = [image.size for image in images]
+      if len(set(orig_image_sizes_in_batch)) > 1:
+        # Resize only if images in the same batch have different sizes.
+        images = [m.resize([width, height], resample=Image.BICUBIC) for m in images]
+      raw_images = [np.array(m) for m in images]
+      size_before_pad = len(raw_images)
+      if size_before_pad < batch_size:
+        padding_size = batch_size - size_before_pad
+        raw_images += [np.zeros_like(raw_images[0])] * padding_size
+      predicted_image_sizes = [np.shape(raw_image)[:2][::-1] for raw_image in raw_images]
+      detections_bs = driver.serve_images(raw_images)
+      for j in range(size_before_pad):
+        detections_per_image = detections_bs[j]
+        image_file_path = Path(batch_files[j])
+        orig_image_size = orig_image_sizes_in_batch[j]
+        predicted_image_size = predicted_image_sizes[j]
+        bboxes = []
+        for detection_per_image in detections_per_image:
+          class_label_id = detection_per_image[6].astype(int)
+          if class_label_id in dict(self.model_config.label_id_mapping):
+            confidence_score_of_bbox = detection_per_image[5]
+            if confidence_score_of_bbox >= kwargs['min_score_thresh']:
+              ymin, xmin, ymax, xmax = detection_per_image[1:5]
+              ymin, ymax = np.array([ymin, ymax]) * orig_image_size[1] / predicted_image_size[1]
+              xmin, xmax = np.array([xmin, xmax]) * orig_image_size[0] / predicted_image_size[0]
+              xmin, ymin = xmin if xmin >= 0 else 0, ymin if ymin >=0 else 0
+              xmax = xmax if xmax <= orig_image_size[0] else orig_image_size[0]
+              ymax = ymax if ymax <= orig_image_size[1] else orig_image_size[1]
+              class_name = self.model_config.label_id_mapping[class_label_id]
+              bbox = AxisAlignedBbox2D(class_label=class_name, confidence_score=confidence_score_of_bbox,
+                                       xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)
+              bboxes.append(bbox)
+        od = ObjectDetectionLabeledData(image_name=image_file_path.name, bounding_boxes=bboxes,
+                                        width=orig_image_size[0], height=orig_image_size[1])
+        od_file_path = f'{image_file_path.parent}/{image_file_path.stem}.prediction.od.json'
+        od.to_json_file(od_file_path)
+        print(f'Saved predictions for {image_file_path.name}.')
+
   def saved_model_inference(self, image_path_pattern, output_dir, **kwargs):
     """Perform inference for the given saved model."""
     driver = inference.ServingDriver(
@@ -169,7 +231,7 @@ class ModelInspector(object):
       images = [Image.open(f) for f in batch_files]
       if len(set([m.size for m in images])) > 1:
         # Resize only if images in the same batch have different sizes.
-        images = [m.resize(height, width) for m in images]
+        images = [m.resize([width, height], resample=Image.BICUBIC) for m in images]
       raw_images = [np.array(m) for m in images]
       size_before_pad = len(raw_images)
       if size_before_pad < batch_size:
@@ -254,6 +316,9 @@ class ModelInspector(object):
 
   def build_and_save_model(self):
     """build and save the model into self.logdir."""
+    # config = tf.ConfigProto()
+    # config.gpu_options.allow_growth = True
+    # with tf.Graph().as_default(), tf.Session(config=config) as sess:
     with tf.Graph().as_default(), tf.Session() as sess:
       # Build model with inputs and labels.
       inputs = tf.placeholder(tf.float32, name='input', shape=self.inputs_shape)
@@ -293,6 +358,9 @@ class ModelInspector(object):
 
   def freeze_model(self) -> Tuple[Text, Text]:
     """Freeze model and convert them into tflite and tf graph."""
+    # config = tf.ConfigProto()
+    # config.gpu_options.allow_growth = True
+    # with tf.Graph().as_default(), tf.Session(config=config) as sess:
     with tf.Graph().as_default(), tf.Session() as sess:
       inputs = tf.placeholder(tf.float32, name='input', shape=self.inputs_shape)
       outputs = self.build_model(inputs)
@@ -424,7 +492,7 @@ class ModelInspector(object):
           kwargs['input_image'],
           trace_filename=kwargs.get('trace_filename', None))
     elif runmode in ('infer', 'saved_model', 'saved_model_infer',
-                     'saved_model_video'):
+                     'saved_model_video', 'saved_model_infer_od_json'):
       config_dict = {}
       if kwargs.get('line_thickness', None):
         config_dict['line_thickness'] = kwargs.get('line_thickness')
@@ -444,6 +512,8 @@ class ModelInspector(object):
       elif runmode == 'saved_model_video':
         self.saved_model_video(kwargs['input_video'], kwargs['output_video'],
                                **config_dict)
+      elif runmode == 'saved_model_infer_od_json':
+          self.saved_model_inference_od_json(kwargs['input_image'], **config_dict)
     elif runmode == 'bm':
       self.benchmark_model(
           warmup_runs=5,

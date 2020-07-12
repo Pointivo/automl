@@ -326,6 +326,7 @@ def det_post_process(params: Dict[Any, Any], cls_outputs: Dict[int, tf.Tensor],
         image_id=[index],
         image_scale=[scales[index]],
         image_size=params['image_size'],
+        nms_configs=params['nms_configs'],
         min_score_thresh=min_score_thresh,
         max_boxes_to_draw=max_boxes_to_draw,
         disable_pyfun=params.get('disable_pyfun'))
@@ -527,7 +528,7 @@ class ServingDriver(object):
 
     self.signitures = None
     self.sess = None
-    self.disable_pyfun = True
+    self.disable_pyfun = self.params.get('disable_pyfun')
     self.use_xla = use_xla
 
     self.min_score_thresh = (min_score_thresh if min_score_thresh is not None
@@ -542,6 +543,7 @@ class ServingDriver(object):
 
   def _build_session(self):
     sess_config = tf.ConfigProto()
+    # sess_config.gpu_options.allow_growth=True
     if self.use_xla:
       sess_config.graph_options.optimizer_options.global_jit_level = (
           tf.OptimizerOptions.ON_2)
@@ -787,7 +789,7 @@ class InferenceDriver(object):
     self.label_id_mapping = parse_label_id_mapping(
         self.params.get('label_id_mapping', None))
 
-    self.disable_pyfun = True
+    self.disable_pyfun = self.params.get('disable_pyfun')
 
   def inference(self, image_path_pattern: Text, output_dir: Text, **kwargs):
     """Read and preprocess input images.
@@ -803,6 +805,9 @@ class InferenceDriver(object):
       Annotated image.
     """
     params = copy.deepcopy(self.params)
+    # config = tf.ConfigProto()
+    # config.gpu_options.allow_growth=True
+    # with tf.Session(config=config) as sess:
     with tf.Session() as sess:
       # Buid inputs and preprocessing.
       raw_images, images, scales = build_inputs(image_path_pattern,

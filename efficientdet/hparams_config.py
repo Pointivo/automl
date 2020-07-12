@@ -267,6 +267,9 @@ def default_detection_configs():
   h.backbone_config = None
   h.var_freeze_expr = None
 
+  # whether to disale pyfunc for nms
+  h.disable_pyfun = False
+
   # RetinaNet.
   h.resnet_depth = 50
   return h

@@ -404,8 +404,9 @@ def coco_metric_fn(batch_size,
         classes_per_sample,
         tf.slice(kwargs['source_ids'], [index], [1]),
         tf.slice(kwargs['image_scales'], [index], [1]),
+        min_score_thresh=kwargs['min_score_thresh'],
         nms_configs=kwargs.get('nms_configs', None),
-        disable_pyfun=kwargs.get('disable_pyfun', None),
+        disable_pyfun=kwargs['disable_pyfun']
     )
     detections_bs.append(detections)
 
@@ -580,6 +581,8 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
             params['val_json_file'],
             testdev_dir=params['testdev_dir'],
             nms_configs=params['nms_configs'],
+            min_score_thresh=params.get('min_score_thresh', 0.4),
+            disable_pyfun=params['disable_pyfun'],
             **kwargs)
       else:
         logging.info('Eval val with groudtruths %s.', params['val_json_file'])
@@ -588,6 +591,8 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
             anchor_labeler,
             params['val_json_file'],
             nms_configs=params['nms_configs'],
+            min_score_thresh=params.get('min_score_thresh', 0.4),
+            disable_pyfun=params['disable_pyfun'],
             **kwargs)
 
       # Add metrics to output.

@@ -13,12 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 """Common utils."""
-
-from __future__ import absolute_import
-from __future__ import division
-# gtype import
-from __future__ import print_function
-
 import contextlib
 import os
 import re
@@ -36,14 +30,14 @@ def srelu_fn(x):
   """Smooth relu: a smooth version of relu."""
   with tf.name_scope('srelu'):
     beta = tf.Variable(20.0, name='srelu_beta', dtype=tf.float32)**2
-    beta = tf.cast(beta, x.dtype)
+    beta = tf.cast(beta**2, x.dtype)
     safe_log = tf.math.log(tf.where(x > 0., beta * x + 1., tf.ones_like(x)))
     return tf.where((x > 0.), x - (1. / beta) * safe_log, tf.zeros_like(x))
 
 
 def activation_fn(features: tf.Tensor, act_type: Text):
   """Customized non-linear activation type."""
-  if act_type == 'swish':
+  if act_type in ('silu', 'swish'):
     return tf.nn.swish(features)
   elif act_type == 'swish_native':
     return features * tf.sigmoid(features)
@@ -71,16 +65,14 @@ def get_ema_vars():
   return list(set(ema_vars))
 
 
-def get_ckpt_var_map(ckpt_path, ckpt_scope, var_scope, var_exclude_expr=None):
+def get_ckpt_var_map(ckpt_path, ckpt_scope, var_scope, skip_mismatch=None):
   """Get a var map for restoring from pretrained checkpoints.
 
   Args:
     ckpt_path: string. A pretrained checkpoint path.
     ckpt_scope: string. Scope name for checkpoint variables.
     var_scope: string. Scope name for model variables.
-    var_exclude_expr: string. A regex for excluding variables.
-      This is useful for finetuning with different classes, where
-      var_exclude_expr='.*class-predict.*' can be used.
+    skip_mismatch: skip variables if shape mismatch.
 
   Returns:
     var_map: a dictionary from checkpoint name to model variables.
@@ -97,31 +89,40 @@ def get_ckpt_var_map(ckpt_path, ckpt_scope, var_scope, var_exclude_expr=None):
   # Get the list of vars to restore.
   model_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=var_scope)
   reader = tf.train.load_checkpoint(ckpt_path)
+  ckpt_var_name_to_shape = reader.get_variable_to_shape_map()
   ckpt_var_names = set(reader.get_variable_to_shape_map().keys())
 
-  exclude_matcher = re.compile(var_exclude_expr) if var_exclude_expr else None
-  for v in model_vars:
-    if exclude_matcher and exclude_matcher.match(v.op.name):
-      logging.info(
-          'skip {} -- excluded by {}'.format(v.op.name, var_exclude_expr))
-      continue
-
+  for i, v in enumerate(model_vars):
     if not v.op.name.startswith(var_scope):
       logging.info('skip {} -- does not match scope {}'.format(
           v.op.name, var_scope))
     ckpt_var = ckpt_scope + v.op.name[len(var_scope):]
-    if ckpt_var not in ckpt_var_names:
-      if v.op.name.endswith('/ExponentialMovingAverage'):
-        ckpt_var = ckpt_scope + v.op.name[:-len('/ExponentialMovingAverage')]
-      if ckpt_var not in ckpt_var_names:
-        if 'Momentum' not in ckpt_var and 'RMSProp' not in ckpt_var:
-          # Only show vars not from optimizer to avoid false alarm.
-          logging.info('skip {} ({}) -- not in ckpt'.format(
-              v.op.name, ckpt_var))
-        continue
+    if (ckpt_var not in ckpt_var_names and
+        v.op.name.endswith('/ExponentialMovingAverage')):
+      ckpt_var = ckpt_scope + v.op.name[:-len('/ExponentialMovingAverage')]
 
-    logging.info('Init {} from ckpt var {}'.format(v.op.name, ckpt_var))
+    if ckpt_var not in ckpt_var_names:
+      if 'Momentum' in ckpt_var or 'RMSProp' in ckpt_var:
+        # Skip optimizer variables.
+        continue
+      if skip_mismatch:
+        logging.info('skip {} ({}) -- not in ckpt'.format(v.op.name, ckpt_var))
+        continue
+      raise ValueError('{} is not in ckpt {}'.format(v.op, ckpt_path))
+
+    if v.shape != ckpt_var_name_to_shape[ckpt_var]:
+      if skip_mismatch:
+        logging.info('skip {} ({} vs {}) -- shape mismatch'.format(
+            v.op.name, v.shape, ckpt_var_name_to_shape[ckpt_var]))
+        continue
+      raise ValueError('shape mismatch {} ({} vs {})'.format(
+          v.op.name, v.shape, ckpt_var_name_to_shape[ckpt_var]))
+
+    if i < 5:
+      # Log the first few elements for sanity check.
+      logging.info('Init {} from ckpt var {}'.format(v.op.name, ckpt_var))
     var_map[ckpt_var] = v
+
   return var_map
 
 

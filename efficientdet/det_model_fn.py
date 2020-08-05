@@ -13,24 +13,20 @@
 # limitations under the License.
 # ==============================================================================
 """Model function definition, including both architecture and loss."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import functools
 import re
 from absl import logging
 import numpy as np
 import tensorflow.compat.v1 as tf
 
-import anchors
 import coco_metric
 import efficientdet_arch
 import hparams_config
 import iou_utils
-import retinanet_arch
+import nms_np
 import utils
+from keras import anchors
+from keras import efficientdet_keras
 from keras import postprocess
 
 _DEFAULT_BATCH_SIZE = 64
@@ -52,6 +48,7 @@ def update_learning_rate_schedule_parameters(params):
   params['second_lr_drop_step'] = int(params['second_lr_drop_epoch'] *
                                       steps_per_epoch)
   params['total_steps'] = int(params['num_epochs'] * steps_per_epoch)
+  params['steps_per_epoch'] = steps_per_epoch
 
 
 def stepwise_lr_schedule(adjusted_learning_rate, lr_warmup_init, lr_warmup_step,
@@ -74,35 +71,16 @@ def stepwise_lr_schedule(adjusted_learning_rate, lr_warmup_init, lr_warmup_step,
   return learning_rate
 
 
-def cosine_lr_schedule_tf2(adjusted_lr, lr_warmup_init, lr_warmup_step,
-                           total_steps, step):
-  """TF2 friendly cosine learning rate schedule."""
-  logging.info('LR schedule method: cosine')
-
-  def warmup_lr(step):
-    return lr_warmup_init + (adjusted_lr - lr_warmup_init) * (
-        tf.cast(step, tf.float32) / tf.cast(lr_warmup_step, tf.float32))
-
-  def cosine_lr(step):
-    decay_steps = tf.cast(total_steps - lr_warmup_step, tf.float32)
-    step = tf.cast(step - lr_warmup_step, tf.float32)
-    cosine_decay = 0.5 * (1 + tf.cos(np.pi * step / decay_steps))
-    alpha = 0.0
-    decayed = (1 - alpha) * cosine_decay + alpha
-    return adjusted_lr * tf.cast(decayed, tf.float32)
-
-  return tf.cond(step <= lr_warmup_step, lambda: warmup_lr(step),
-                 lambda: cosine_lr(step))
-
-
 def cosine_lr_schedule(adjusted_lr, lr_warmup_init, lr_warmup_step, total_steps,
                        step):
+  """Cosine learning rate scahedule."""
   logging.info('LR schedule method: cosine')
   linear_warmup = (
       lr_warmup_init + (tf.cast(step, dtype=tf.float32) / lr_warmup_step *
                         (adjusted_lr - lr_warmup_init)))
+  decay_steps = tf.cast(total_steps - lr_warmup_step, tf.float32)
   cosine_lr = 0.5 * adjusted_lr * (
-      1 + tf.cos(np.pi * tf.cast(step, tf.float32) / total_steps))
+      1 + tf.cos(np.pi * tf.cast(step, tf.float32) / decay_steps))
   return tf.where(step < lr_warmup_step, linear_warmup, cosine_lr)
 
 
@@ -182,7 +160,7 @@ def focal_loss(y_pred, y_true, alpha, gamma, normalizer, label_smoothing=0.0):
     ce = tf.nn.sigmoid_cross_entropy_with_logits(labels=y_true, logits=y_pred)
 
     # compute the final loss and return
-    return alpha_factor * modulating_factor * ce / normalizer
+    return (1 / normalizer) * alpha_factor * modulating_factor * ce
 
 
 def _box_loss(box_outputs, box_targets, num_positives, delta=0.1):
@@ -239,7 +217,6 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
 
   cls_losses = []
   box_losses = []
-  box_iou_losses = []
   for level in levels:
     # Onehot encoding for classification labels.
     cls_targets_at_level = tf.one_hot(labels['cls_targets_%d' % level],
@@ -282,91 +259,38 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
               num_positives_sum,
               delta=params['delta']))
 
-    if params['iou_loss_type']:
-      box_iou_losses.append(
-          _box_iou_loss(box_outputs[level], box_targets_at_level,
-                        num_positives_sum, params['iou_loss_type']))
+  if params['iou_loss_type']:
+    input_anchors = anchors.Anchors(params['min_level'], params['max_level'],
+                                    params['num_scales'],
+                                    params['aspect_ratios'],
+                                    params['anchor_scale'],
+                                    params['image_size'])
+    box_output_list = [tf.reshape(box_outputs[i], [-1, 4]) for i in levels]
+    box_outputs = tf.concat(box_output_list, axis=0)
+    box_target_list = [
+        tf.reshape(labels['box_targets_%d' % level], [-1, 4])
+        for level in levels
+    ]
+    box_targets = tf.concat(box_target_list, axis=0)
+    anchor_boxes = tf.tile(input_anchors.boxes, [params['batch_size'], 1])
+    box_outputs = anchors.decode_box_outputs(box_outputs, anchor_boxes)
+    box_targets = anchors.decode_box_outputs(box_targets, anchor_boxes)
+    box_iou_loss = _box_iou_loss(box_outputs, box_targets, num_positives_sum,
+                                 params['iou_loss_type'])
+
+  else:
+    box_iou_loss = 0
 
   # Sum per level losses to total loss.
   cls_loss = tf.add_n(cls_losses)
   box_loss = tf.add_n(box_losses) if box_losses else 0
-  box_iou_loss = tf.add_n(box_iou_losses) if box_iou_losses else 0
+
   total_loss = (
       cls_loss +
       params['box_loss_weight'] * box_loss +
       params['iou_loss_weight'] * box_iou_loss)
 
   return total_loss, cls_loss, box_loss, box_iou_loss
-
-
-# TODO(tanmingxing): delete this function after clean up inference.py
-def add_metric_fn_inputs(params,
-                         cls_outputs,
-                         box_outputs,
-                         metric_fn_inputs,
-                         max_detection_points=anchors.MAX_DETECTION_POINTS):
-  """Selects top-k predictions and adds the selected to metric_fn_inputs.
-
-  Args:
-    params: a parameter dictionary that includes `min_level`, `max_level`,
-      `batch_size`, and `num_classes`.
-    cls_outputs: an OrderDict with keys representing levels and values
-      representing logits in [batch_size, height, width, num_anchors].
-    box_outputs: an OrderDict with keys representing levels and values
-      representing box regression targets in [batch_size, height, width,
-      num_anchors * 4].
-    metric_fn_inputs: a dictionary that will hold the top-k selections.
-    max_detection_points: an integer specifing the maximum detection points to
-      keep before NMS. Keep all anchors if max_detection_points <= 0.
-  """
-  batch_size = params['batch_size']
-  num_classes = params['num_classes']
-  cls_outputs_all = []
-  box_outputs_all = []
-  # Concatenates class and box of all levels into one tensor.
-  for level in range(params['min_level'], params['max_level'] + 1):
-    if params['data_format'] == 'channels_first':
-      cls_outputs[level] = tf.transpose(cls_outputs[level], [0, 2, 3, 1])
-      box_outputs[level] = tf.transpose(box_outputs[level], [0, 2, 3, 1])
-
-    cls_outputs_all.append(
-        tf.reshape(cls_outputs[level], [batch_size, -1, num_classes]))
-    box_outputs_all.append(tf.reshape(box_outputs[level], [batch_size, -1, 4]))
-  cls_outputs_all = tf.concat(cls_outputs_all, 1)
-  box_outputs_all = tf.concat(box_outputs_all, 1)
-
-  if max_detection_points > 0:
-    # Prune anchors and detections to only keep max_detection_points.
-    # Due to some issues, top_k is currently slow in graph model.
-    cls_outputs_all_reshape = tf.reshape(cls_outputs_all, [batch_size, -1])
-    _, cls_topk_indices = tf.math.top_k(
-        cls_outputs_all_reshape, k=max_detection_points, sorted=False)
-    indices = cls_topk_indices // num_classes
-    classes = cls_topk_indices % num_classes
-    cls_indices = tf.stack([indices, classes], axis=2)
-    cls_outputs_all_after_topk = tf.gather_nd(
-        cls_outputs_all, cls_indices, batch_dims=1)
-    box_outputs_all_after_topk = tf.gather_nd(
-        box_outputs_all, tf.expand_dims(indices, 2), batch_dims=1)
-  else:
-    # Keep all anchors, but for each anchor, just keep the max probablity for
-    # each class.
-    cls_outputs_idx = tf.math.argmax(
-        cls_outputs_all, axis=-1, output_type=tf.int32)
-    num_anchors = cls_outputs_all.shape[1]
-
-    classes = cls_outputs_idx
-    indices = tf.tile(
-        tf.expand_dims(tf.range(num_anchors), axis=0), [batch_size, 1])
-    cls_outputs_all_after_topk = tf.reduce_max(cls_outputs_all, -1)
-    box_outputs_all_after_topk = box_outputs_all
-
-  metric_fn_inputs['cls_outputs_all'] = cls_outputs_all_after_topk
-  metric_fn_inputs['box_outputs_all'] = box_outputs_all_after_topk
-  metric_fn_inputs['indices_all'] = indices
-  metric_fn_inputs['classes_all'] = classes
-
-
 
 
 def reg_l2_loss(weight_decay, regex=r'.*(kernel|weight):0$'):
@@ -404,13 +328,21 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
   utils.image('input_image', features)
   training_hooks = []
 
-  def _model_outputs(inputs):
-    # Convert params (dict) to Config for easier access.
-    return model(inputs, config=hparams_config.Config(params))
+  if params['use_keras_model']:
+    def model_fn(inputs):
+      model = efficientdet_keras.EfficientDetNet(
+          config=hparams_config.Config(params))
+      cls_out_list, box_out_list = model(inputs, params['is_training_bn'])
+      for i in range(params['min_level'], params['max_level'] + 1):
+        cls_outputs[i] = cls_out_list[i - params['min_level']]
+        box_outputs[i] = box_out_list[i - params['min_level']]
+      return cls_outputs, box_outputs
+  else:
+    model_fn = functools.partial(model, config=hparams_config.Config(params))
 
   precision = utils.get_precision(params['strategy'], params['mixed_precision'])
   cls_outputs, box_outputs = utils.build_model_with_precision(
-      precision, _model_outputs, features, params['is_training_bn'])
+      precision, model_fn, features, params['is_training_bn'])
 
   levels = cls_outputs.keys()
   for level in levels:
@@ -447,6 +379,8 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
     utils.scalar('trainloss/loss', total_loss)
     if params['iou_loss_type']:
       utils.scalar('trainloss/box_iou_loss', box_iou_loss)
+    train_epochs = tf.cast(global_step, tf.float32) / params['steps_per_epoch']
+    utils.scalar('train_epochs', train_epochs)
 
   moving_average_decay = params['moving_average_decay']
   if moving_average_decay:
@@ -507,18 +441,53 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
 
     def metric_fn(**kwargs):
       """Returns a dictionary that has the evaluation metrics."""
+      if params['nms_configs'].get('pyfunc', True):
+        detections_bs = []
+        for index in range(kwargs['boxes'].shape[0]):
+          nms_configs = params['nms_configs']
+          detections = tf.numpy_function(
+              functools.partial(nms_np.per_class_nms, nms_configs=nms_configs),
+              [
+                  kwargs['boxes'][index],
+                  kwargs['scores'][index],
+                  kwargs['classes'][index],
+                  tf.slice(kwargs['image_ids'], [index], [1]),
+                  tf.slice(kwargs['image_scales'], [index], [1]),
+                  params['num_classes'],
+                  nms_configs['max_output_size'],
+              ], tf.float32)
+          detections_bs.append(detections)
+      else:
+        # These two branches should be equivalent, but currently they are not.
+        # TODO(tanmingxing): enable the non_pyfun path after bug fix.
+        nms_boxes, nms_scores, nms_classes, _ = postprocess.per_class_nms(
+            params, kwargs['boxes'], kwargs['scores'], kwargs['classes'],
+            kwargs['image_scales'])
+        img_ids = tf.cast(
+            tf.expand_dims(kwargs['image_ids'], -1), nms_scores.dtype)
+        detections_bs = [
+            img_ids * tf.ones_like(nms_scores),
+            nms_boxes[:, :, 1],
+            nms_boxes[:, :, 0],
+            nms_boxes[:, :, 3] - nms_boxes[:, :, 1],
+            nms_boxes[:, :, 2] - nms_boxes[:, :, 0],
+            nms_scores,
+            nms_classes,
+        ]
+        detections_bs = tf.stack(detections_bs, axis=-1, name='detnections')
+
       if params.get('testdev_dir', None):
         logging.info('Eval testdev_dir %s', params['testdev_dir'])
         eval_metric = coco_metric.EvaluationMetric(
             testdev_dir=params['testdev_dir'])
-        coco_metrics = eval_metric.estimator_metric_fn(kwargs['detections_bs'],
+        coco_metrics = eval_metric.estimator_metric_fn(detections_bs,
                                                        tf.zeros([1]))
       else:
         logging.info('Eval val with groudtruths %s.', params['val_json_file'])
         eval_metric = coco_metric.EvaluationMetric(
             filename=params['val_json_file'])
         coco_metrics = eval_metric.estimator_metric_fn(
-            kwargs['detections_bs'], kwargs['groundtruth_data'])
+            detections_bs, kwargs['groundtruth_data'])
 
       # Add metrics to output.
       cls_loss = tf.metrics.mean(kwargs['cls_loss_repeat'])
@@ -539,19 +508,20 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
             params['batch_size'],
         ]), [params['batch_size'], 1])
 
+    cls_outputs = postprocess.to_list(cls_outputs)
+    box_outputs = postprocess.to_list(box_outputs)
     params['nms_configs']['max_nms_inputs'] = anchors.MAX_DETECTION_POINTS
-    detections_bs = postprocess.generate_detections(params, cls_outputs,
-                                                    box_outputs,
-                                                    labels['image_scales'],
-                                                    labels['source_ids'])
-
+    boxes, scores, classes = postprocess.pre_nms(params, cls_outputs,
+                                                 box_outputs)
     metric_fn_inputs = {
         'cls_loss_repeat': cls_loss_repeat,
         'box_loss_repeat': box_loss_repeat,
-        'source_ids': labels['source_ids'],
+        'image_ids': labels['source_ids'],
         'groundtruth_data': labels['groundtruth_data'],
         'image_scales': labels['image_scales'],
-        'detections_bs': detections_bs,
+        'boxes': boxes,
+        'scores': scores,
+        'classes': classes,
     }
     eval_metrics = (metric_fn, metric_fn_inputs)
 
@@ -582,7 +552,7 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
           ckpt_path=checkpoint,
           ckpt_scope=ckpt_scope,
           var_scope=var_scope,
-          var_exclude_expr=params.get('var_exclude_expr', None))
+          skip_mismatch=params['skip_mismatch'])
 
       tf.train.init_from_checkpoint(checkpoint, var_map)
 
@@ -624,19 +594,6 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
       training_hooks=training_hooks)
 
 
-def retinanet_model_fn(features, labels, mode, params):
-  """RetinaNet model."""
-  variable_filter_fn = functools.partial(
-      retinanet_arch.remove_variables, resnet_depth=params['resnet_depth'])
-  return _model_fn(
-      features,
-      labels,
-      mode,
-      params,
-      model=retinanet_arch.retinanet,
-      variable_filter_fn=variable_filter_fn)
-
-
 def efficientdet_model_fn(features, labels, mode, params):
   """EfficientDet model."""
   variable_filter_fn = functools.partial(
@@ -652,9 +609,6 @@ def efficientdet_model_fn(features, labels, mode, params):
 
 def get_model_arch(model_name='efficientdet-d0'):
   """Get model architecture for a given model name."""
-  if 'retinanet' in model_name:
-    return retinanet_arch.retinanet
-
   if 'efficientdet' in model_name:
     return efficientdet_arch.efficientdet
 
@@ -663,9 +617,6 @@ def get_model_arch(model_name='efficientdet-d0'):
 
 def get_model_fn(model_name='efficientdet-d0'):
   """Get model fn for a given model name."""
-  if 'retinanet' in model_name:
-    return retinanet_model_fn
-
   if 'efficientdet' in model_name:
     return efficientdet_model_fn
 

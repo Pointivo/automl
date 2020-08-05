@@ -13,11 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 """Tests for efficientdet_arch."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 from absl import logging
 import tensorflow.compat.v1 as tf
 
@@ -183,46 +178,6 @@ class FreezeTest(tf.test.TestCase):
     freeze_var_list = efficientdet_arch.freeze_vars(var_list,
                                                     '(efficientnet|fpn_cells)')
     self.assertEqual(len(freeze_var_list), 1)
-
-
-class BiFPNTest(tf.test.TestCase):
-
-  def test_bifpn_dynamic_l3l7(self):
-    p1 = efficientdet_arch.bifpn_dynamic_config(3, 7, None)
-    # pyformat: disable
-    self.assertEqual(
-        p1.nodes,
-        [
-            {'feat_level': 6, 'inputs_offsets': [3, 4]},
-            {'feat_level': 5, 'inputs_offsets': [2, 5]},
-            {'feat_level': 4, 'inputs_offsets': [1, 6]},
-            {'feat_level': 3, 'inputs_offsets': [0, 7]},
-            {'feat_level': 4, 'inputs_offsets': [1, 7, 8]},
-            {'feat_level': 5, 'inputs_offsets': [2, 6, 9]},
-            {'feat_level': 6, 'inputs_offsets': [3, 5, 10]},
-            {'feat_level': 7, 'inputs_offsets': [4, 11]},
-        ])
-    # pyformat: enable
-
-  def test_bifpn_dynamic_l2l7(self):
-    p = efficientdet_arch.bifpn_dynamic_config(2, 7, None)
-
-    # pyformat: disable
-    self.assertEqual(
-        p.nodes,
-        [
-            {'feat_level': 6, 'inputs_offsets': [4, 5]},
-            {'feat_level': 5, 'inputs_offsets': [3, 6]},
-            {'feat_level': 4, 'inputs_offsets': [2, 7]},
-            {'feat_level': 3, 'inputs_offsets': [1, 8]},
-            {'feat_level': 2, 'inputs_offsets': [0, 9]},
-            {'feat_level': 3, 'inputs_offsets': [1, 9, 10]},
-            {'feat_level': 4, 'inputs_offsets': [2, 8, 11]},
-            {'feat_level': 5, 'inputs_offsets': [3, 7, 12]},
-            {'feat_level': 6, 'inputs_offsets': [4, 6, 13]},
-            {'feat_level': 7, 'inputs_offsets': [5, 14]},
-        ])
-    # pyformat: enable
 
 
 class FeatureFusionTest(tf.test.TestCase):

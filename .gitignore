@@ -1,5 +1,6 @@
 __pycache__
 .DS_Store
+.vscode
 tmp
 /.idea/.gitignore
 /.idea/automl.iml

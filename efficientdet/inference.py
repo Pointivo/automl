@@ -13,30 +13,23 @@
 # limitations under the License.
 # ==============================================================================
 r"""Inference related utilities."""
-
-from __future__ import absolute_import
-from __future__ import division
-# gtype import
-from __future__ import print_function
-
 import copy
 import functools
 import os
 import time
 from typing import Text, Dict, Any, List, Tuple, Union
-
 from absl import logging
 import numpy as np
 from PIL import Image
 import tensorflow.compat.v1 as tf
 import yaml
 
-import anchors
 import dataloader
 import det_model_fn
 import hparams_config
 import utils
 from keras import efficientdet_keras
+from keras import postprocess
 from visualize import vis_utils
 from tensorflow.python.client import timeline  # pylint: disable=g-direct-tensorflow-import
 
@@ -172,7 +165,7 @@ def build_model(model_name: Text, inputs: tf.Tensor, **kwargs):
       config = hparams_config.get_efficientdet_config(model_name)
       config.override(kwargs)
       model = efficientdet_keras.EfficientDetNet(config=config)
-      cls_out_list, box_out_list = model(feats)
+      cls_out_list, box_out_list = model(feats, training=False)
       # convert the list of model outputs to a dictionary with key=level.
       assert len(cls_out_list) == config.max_level - config.min_level + 1
       assert len(box_out_list) == config.max_level - config.min_level + 1
@@ -182,12 +175,11 @@ def build_model(model_name: Text, inputs: tf.Tensor, **kwargs):
         box_outputs[i] = box_out_list[i - config.min_level]
       return cls_outputs, box_outputs
 
-    cls_outputs, box_outputs = utils.build_model_with_precision(
-        precision, model_arch, inputs, False, model_name, **kwargs)
   else:
     model_arch = det_model_fn.get_model_arch(model_name)
-    cls_outputs, box_outputs = utils.build_model_with_precision(
-        precision, model_arch, inputs, False, model_name, **kwargs)
+
+  cls_outputs, box_outputs = utils.build_model_with_precision(
+      precision, model_arch, inputs, False, model_name, **kwargs)
 
   if mixed_precision:
     # Post-processing has multiple places with hard-coded float32.
@@ -237,63 +229,8 @@ def restore_ckpt(sess, ckpt_path, ema_decay=0.9998, export_ckpt=None):
     saver.save(sess, export_ckpt)
 
 
-def det_post_process_combined(params, cls_outputs, box_outputs, scales,
-                              min_score_thresh, max_boxes_to_draw):
-  """A combined version of det_post_process with dynamic batch size support."""
-  batch_size = tf.shape(list(cls_outputs.values())[0])[0]
-  cls_outputs_all = []
-  box_outputs_all = []
-  # Concatenates class and box of all levels into one tensor.
-  for level in range(params['min_level'], params['max_level'] + 1):
-    if params['data_format'] == 'channels_first':
-      cls_outputs[level] = tf.transpose(cls_outputs[level], [0, 2, 3, 1])
-      box_outputs[level] = tf.transpose(box_outputs[level], [0, 2, 3, 1])
-
-    cls_outputs_all.append(
-        tf.reshape(cls_outputs[level], [batch_size, -1, params['num_classes']]))
-    box_outputs_all.append(tf.reshape(box_outputs[level], [batch_size, -1, 4]))
-  cls_outputs_all = tf.concat(cls_outputs_all, 1)
-  box_outputs_all = tf.concat(box_outputs_all, 1)
-
-  # Create anchor_label for picking top-k predictions.
-  eval_anchors = anchors.Anchors(params['min_level'], params['max_level'],
-                                 params['num_scales'], params['aspect_ratios'],
-                                 params['anchor_scale'], params['image_size'])
-  anchor_boxes = eval_anchors.boxes
-  scores = tf.math.sigmoid(cls_outputs_all)
-  # apply bounding box regression to anchors
-  boxes = anchors.decode_box_outputs_tf(box_outputs_all, anchor_boxes)
-  boxes = tf.expand_dims(boxes, axis=2)
-  scales = tf.expand_dims(scales, axis=-1)
-  nmsed_boxes, nmsed_scores, nmsed_classes, valid_detections = (
-      tf.image.combined_non_max_suppression(
-          boxes,
-          scores,
-          max_boxes_to_draw,
-          max_boxes_to_draw,
-          score_threshold=min_score_thresh,
-          clip_boxes=False))
-  del valid_detections  # to be used in futue.
-
-  image_ids = tf.cast(
-      tf.tile(
-          tf.expand_dims(tf.range(batch_size), axis=1), [1, max_boxes_to_draw]),
-      dtype=tf.float32)
-  image_size = utils.parse_image_size(params['image_size'])
-  ymin = tf.clip_by_value(nmsed_boxes[..., 0], 0, image_size[0]) * scales
-  xmin = tf.clip_by_value(nmsed_boxes[..., 1], 0, image_size[1]) * scales
-  ymax = tf.clip_by_value(nmsed_boxes[..., 2], 0, image_size[0]) * scales
-  xmax = tf.clip_by_value(nmsed_boxes[..., 3], 0, image_size[1]) * scales
-
-  classes = tf.cast(nmsed_classes + 1, tf.float32)
-  detection_list = [image_ids, ymin, xmin, ymax, xmax, nmsed_scores, classes]
-  detections = tf.stack(detection_list, axis=2, name='detections')
-  return detections
-
-
 def det_post_process(params: Dict[Any, Any], cls_outputs: Dict[int, tf.Tensor],
-                     box_outputs: Dict[int, tf.Tensor], scales: List[float],
-                     min_score_thresh, max_boxes_to_draw):
+                     box_outputs: Dict[int, tf.Tensor], scales: List[float]):
   """Post preprocessing the box/class predictions.
 
   Args:
@@ -305,9 +242,6 @@ def det_post_process(params: Dict[Any, Any], cls_outputs: Dict[int, tf.Tensor],
       representing box regression targets in [batch_size, height, width,
       num_anchors * 4].
     scales: a list of float values indicating image scale.
-    min_score_thresh: A float representing the threshold for deciding when to
-      remove boxes based on score.
-    max_boxes_to_draw: Max number of boxes to draw.
 
   Returns:
     detections_batch: a batch of detection results. Each detection is a tensor
@@ -316,49 +250,24 @@ def det_post_process(params: Dict[Any, Any], cls_outputs: Dict[int, tf.Tensor],
   batch_size = cls_outputs[params['min_level']].shape[0]
   if not batch_size:
     # Use combined version for dynamic batch size.
-    return det_post_process_combined(params, cls_outputs, box_outputs, scales,
-                                     min_score_thresh, max_boxes_to_draw)
+    nms_boxes, nms_scores, nms_classes, _ = postprocess.postprocess_combined(
+        params, cls_outputs, box_outputs, scales)
+    batch_size = tf.shape(list(cls_outputs.values())[0])[0]
+  else:
+    nms_boxes, nms_scores, nms_classes, _ = postprocess.postprocess_global(
+        params, cls_outputs, box_outputs, scales)
 
-  # TODO(tanmingxing): refactor the code to make it more explicity.
-  outputs = {
-      'cls_outputs_all': [None],
-      'box_outputs_all': [None],
-      'indices_all': [None],
-      'classes_all': [None]
-  }
-  det_model_fn.add_metric_fn_inputs(params, cls_outputs, box_outputs, outputs,
-                                    -1)
-
-  # Create anchor_label for picking top-k predictions.
-  eval_anchors = anchors.Anchors(params['min_level'], params['max_level'],
-                                 params['num_scales'], params['aspect_ratios'],
-                                 params['anchor_scale'], params['image_size'])
-  anchor_labeler = anchors.AnchorLabeler(eval_anchors, params['num_classes'])
-
-  # Add all detections for each input image.
-  detections_batch = []
-  for index in range(params['batch_size']):
-    cls_outputs_per_sample = outputs['cls_outputs_all'][index]
-    box_outputs_per_sample = outputs['box_outputs_all'][index]
-    indices_per_sample = outputs['indices_all'][index]
-    classes_per_sample = outputs['classes_all'][index]
-    detections = anchor_labeler.generate_detections(
-        cls_outputs_per_sample,
-        box_outputs_per_sample,
-        indices_per_sample,
-        classes_per_sample,
-        image_id=[index],
-        image_scale=[scales[index]],
-        image_size=params['image_size'],
-        min_score_thresh=min_score_thresh,
-        max_boxes_to_draw=max_boxes_to_draw,
-        disable_pyfun=params.get('disable_pyfun'))
-    if params['batch_size'] > 1:
-      # pad to fixed length if batch size > 1.
-      padding_size = max_boxes_to_draw - tf.shape(detections)[0]
-      detections = tf.pad(detections, [[0, padding_size], [0, 0]])
-    detections_batch.append(detections)
-  return tf.stack(detections_batch, name='detections')
+  img_ids = tf.expand_dims(tf.range(0, batch_size, dtype=nms_scores.dtype), -1)
+  detections = [
+      img_ids * tf.ones_like(nms_scores),
+      nms_boxes[:, :, 0],
+      nms_boxes[:, :, 1],
+      nms_boxes[:, :, 2],
+      nms_boxes[:, :, 3],
+      nms_scores,
+      nms_classes,
+  ]
+  return tf.stack(detections, axis=-1, name='detections')
 
 
 def visualize_image(image,
@@ -366,8 +275,8 @@ def visualize_image(image,
                     classes,
                     scores,
                     id_mapping=None,
-                    min_score_thresh=anchors.MIN_SCORE_THRESH,
-                    max_boxes_to_draw=anchors.MAX_DETECTIONS_PER_IMAGE,
+                    min_score_thresh=0.01,
+                    max_boxes_to_draw=1000,
                     line_thickness=2,
                     **kwargs):
   """Visualizes a given image.
@@ -437,7 +346,6 @@ def parse_label_id_mapping(
 
 def visualize_image_prediction(image,
                                prediction,
-                               disable_pyfun=True,
                                label_id_mapping=None,
                                **kwargs):
   """Viusalize detections on a given image.
@@ -446,7 +354,6 @@ def visualize_image_prediction(image,
     image: Image content in shape of [height, width, 3].
     prediction: a list of vector, with each vector has the format of [image_id,
       ymin, xmin, ymax, xmax, score, class].
-    disable_pyfun: disable pyfunc for faster post processing.
     label_id_mapping: a map from label id to name.
     **kwargs: extra parameters for vistualization, such as min_score_thresh,
       max_boxes_to_draw, and line_thickness.
@@ -457,11 +364,6 @@ def visualize_image_prediction(image,
   boxes = prediction[:, 1:5]
   classes = prediction[:, 6].astype(int)
   scores = prediction[:, 5]
-
-  if not disable_pyfun:
-    # convert [x, y, width, height] to [y, x, height, width]
-    boxes[:, [0, 1, 2, 3]] = boxes[:, [1, 0, 3, 2]]
-
   label_id_mapping = label_id_mapping or coco_id_mapping
 
   return visualize_image(image, boxes, classes, scores, label_id_mapping,
@@ -552,13 +454,10 @@ class ServingDriver(object):
 
     self.signitures = None
     self.sess = None
-    self.disable_pyfun = True
     self.use_xla = use_xla
 
-    self.min_score_thresh = (min_score_thresh if min_score_thresh is not None
-                             else anchors.MIN_SCORE_THRESH)
-    self.max_boxes_to_draw = (
-        max_boxes_to_draw or anchors.MAX_DETECTIONS_PER_IMAGE)
+    self.min_score_thresh = min_score_thresh
+    self.max_boxes_to_draw = max_boxes_to_draw
     self.line_thickness = line_thickness
 
   def __del__(self):
@@ -590,11 +489,8 @@ class ServingDriver(object):
         images = tf.transpose(images, [0, 3, 1, 2])
       class_outputs, box_outputs = build_model(self.model_name, images,
                                                **params)
-      params.update(
-          dict(batch_size=self.batch_size, disable_pyfun=self.disable_pyfun))
-      detections = det_post_process(params, class_outputs, box_outputs, scales,
-                                    self.min_score_thresh,
-                                    self.max_boxes_to_draw)
+      params.update(dict(batch_size=self.batch_size))
+      detections = det_post_process(params, class_outputs, box_outputs, scales)
 
       restore_ckpt(
           self.sess,
@@ -614,7 +510,6 @@ class ServingDriver(object):
     return visualize_image_prediction(
         image,
         prediction,
-        disable_pyfun=self.disable_pyfun,
         label_id_mapping=self.label_id_mapping,
         **kwargs)
 
@@ -811,8 +706,6 @@ class InferenceDriver(object):
     self.label_id_mapping = parse_label_id_mapping(
         self.params.get('label_id_mapping', None))
 
-    self.disable_pyfun = True
-
   def inference(self, image_path_pattern: Text, output_dir: Text, **kwargs):
     """Read and preprocess input images.
 
@@ -841,27 +734,15 @@ class InferenceDriver(object):
           self.ckpt_path,
           ema_decay=self.params['moving_average_decay'],
           export_ckpt=None)
-      # for postprocessing.
-      params.update(
-          dict(batch_size=len(raw_images), disable_pyfun=self.disable_pyfun))
-
       # Build postprocessing.
-      detections_batch = det_post_process(
-          params,
-          class_outputs,
-          box_outputs,
-          scales,
-          min_score_thresh=kwargs.get('min_score_thresh',
-                                      anchors.MIN_SCORE_THRESH),
-          max_boxes_to_draw=kwargs.get('max_boxes_to_draw',
-                                       anchors.MAX_DETECTIONS_PER_IMAGE))
+      detections_batch = det_post_process(params, class_outputs, box_outputs,
+                                          scales)
       predictions = sess.run(detections_batch)
       # Visualize results.
       for i, prediction in enumerate(predictions):
         img = visualize_image_prediction(
             raw_images[i],
             prediction,
-            disable_pyfun=self.disable_pyfun,
             label_id_mapping=self.label_id_mapping,
             **kwargs)
         output_image_path = os.path.join(output_dir, str(i) + '.jpg')

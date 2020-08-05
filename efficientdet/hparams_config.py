@@ -13,18 +13,12 @@
 # limitations under the License.
 # ==============================================================================
 """Hparams for model architecture and trainer."""
-
-from __future__ import absolute_import
-from __future__ import division
-# gtype import
-from __future__ import print_function
-
 import ast
 import collections
 import copy
 from typing import Any, Dict, Text
 import six
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 import yaml
 
 
@@ -119,7 +113,7 @@ class Config(object):
 
   def save_to_yaml(self, yaml_file_path):
     """Write a dictionary into a yaml file."""
-    with tf.gfile.Open(yaml_file_path, 'w') as f:
+    with tf.io.gfile.GFile(yaml_file_path, 'w') as f:
       yaml.dump(self.as_dict(), f, default_flow_style=False)
 
   def parse_from_str(self, config_str: Text) -> Dict[Any, Any]:
@@ -181,16 +175,19 @@ def default_detection_configs():
   h.image_size = 640  # An integer or a string WxH such as 640x320.
   h.target_size = None
   h.input_rand_hflip = True
-  h.train_scale_min = 0.1
-  h.train_scale_max = 2.0
+  h.jitter_min = 0.1
+  h.jitter_max = 2.0
   h.autoaugment_policy = None
   h.use_augmix = False
   # mixture_width, mixture_depth, alpha
   h.augmix_params = (3, -1, 1)
+  h.sample_image = None
 
   # dataset specific parameters
   # TODO(tanmingxing): update this to be 91 for COCO, and 21 for pascal.
   h.num_classes = 90  # 1+ actual classes, 0 is reserved for background.
+  h.seg_num_classes = 3  # segmentation classes
+  h.heads = ['object_detection']  # 'object_detection', 'segmentation'
 
   h.skip_crowd_during_training = True
   h.label_id_mapping = None
@@ -249,7 +246,7 @@ def default_detection_configs():
 
   # For post-processing nms, must be a dict.
   h.nms_configs = {
-      'method': 'hard',
+      'method': 'gaussian',
       'iou_thresh': None,  # use the default value based on method.
       'score_thresh': None,
       'sigma': None,
@@ -269,8 +266,8 @@ def default_detection_configs():
   h.lr_decay_method = 'cosine'
   h.moving_average_decay = 0.9998
   h.ckpt_var_scope = None  # ckpt variable scope.
-  # exclude vars when loading pretrained ckpts.
-  h.var_exclude_expr = '.*/class-predict/.*'  # exclude class weights in default
+  # If true, skip loading pretrained weights if shape mismatches.
+  h.skip_mismatch = True
 
   h.backbone_name = 'efficientnet-b1'
   h.backbone_config = None
@@ -279,7 +276,7 @@ def default_detection_configs():
   # A temporary flag to switch between legacy and keras models.
   h.use_keras_model = None
 
-  # RetinaNet.
+  # unused.
   h.resnet_depth = 50
   return h
 
@@ -360,6 +357,18 @@ efficientdet_model_param_dict = {
             anchor_scale=5.0,
             fpn_weight_method='sum',  # Use unweighted sum for stability.
         ),
+    'efficientdet-d7x':
+        dict(
+            name='efficientdet-d7x',
+            backbone_name='efficientnet-b7',
+            image_size=1536,
+            fpn_num_filters=384,
+            fpn_cell_repeats=8,
+            box_class_repeats=5,
+            anchor_scale=4.0,
+            max_level=8,
+            fpn_weight_method='sum',  # Use unweighted sum for stability.
+        ),
 }
 
 efficientdet_lite_param_dict = {
@@ -430,33 +439,8 @@ def get_efficientdet_config(model_name='efficientdet-d1'):
   return h
 
 
-retinanet_model_param_dict = {
-    'retinanet-50':
-        dict(name='retinanet-50', backbone_name='resnet50', resnet_depth=50),
-    'retinanet-101':
-        dict(name='retinanet-101', backbone_name='resnet101', resnet_depth=101),
-}
-
-
-def get_retinanet_config(model_name='retinanet-50'):
-  """Get the default config for EfficientDet based on model name."""
-  h = default_detection_configs()
-  h.override(dict(
-      retinanet_model_param_dict[model_name],
-      ckpt_var_scope='',
-  ))
-  # cosine + ema often cause NaN for RetinaNet, so we use the default
-  # stepwise without ema used in the original RetinaNet implementation.
-  h.lr_decay_method = 'stepwise'
-  h.moving_average_decay = 0
-
-  return h
-
-
 def get_detection_config(model_name):
   if model_name.startswith('efficientdet'):
     return get_efficientdet_config(model_name)
-  elif model_name.startswith('retinanet'):
-    return get_retinanet_config(model_name)
   else:
-    raise ValueError('model name must start with efficientdet or retinanet.')
+    raise ValueError('model name must start with efficientdet.')
